@@ -18,11 +18,11 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as crypto from "node:crypto";
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
 
 // =============================================================================
@@ -305,6 +305,9 @@ interface AgentConfig {
 
 let agentSecrets: AgentConfig | null = null;
 
+// Validate agent ID format (UUID or alphanumeric with hyphens/underscores)
+const VALID_AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
 function loadAgentSecrets(): AgentConfig {
   if (agentSecrets) return agentSecrets;
 
@@ -314,11 +317,33 @@ function loadAgentSecrets(): AgentConfig {
   const agentsJson = process.env.AX_AGENTS;
   if (agentsJson) {
     try {
-      const agents = JSON.parse(agentsJson) as Array<{ id: string; secret: string }>;
-      for (const agent of agents) {
-        if (agent.id && agent.secret) {
-          agentSecrets[agent.id] = agent.secret;
+      const agents = JSON.parse(agentsJson);
+      if (!Array.isArray(agents)) {
+        console.error(`[ax-platform] AX_AGENTS must be a JSON array`);
+      } else {
+        for (const agent of agents) {
+          // Validate entry is an object with id and secret strings
+          if (typeof agent !== 'object' || agent === null) {
+            console.warn(`[ax-platform] Skipping invalid AX_AGENTS entry: not an object`);
+            continue;
+          }
+          const id = typeof agent.id === 'string' ? agent.id.trim() : '';
+          const secret = typeof agent.secret === 'string' ? agent.secret.trim() : '';
+
+          if (!id || !secret) {
+            console.warn(`[ax-platform] Skipping AX_AGENTS entry with missing id or secret`);
+            continue;
+          }
+          if (!VALID_AGENT_ID_PATTERN.test(id)) {
+            console.warn(`[ax-platform] Skipping AX_AGENTS entry with invalid id format: ${id.substring(0, 20)}`);
+            continue;
+          }
+          if (agentSecrets[id]) {
+            console.warn(`[ax-platform] Duplicate agent id in AX_AGENTS: ${id.substring(0, 20)}`);
+          }
+          agentSecrets[id] = secret;
         }
+        console.log(`[ax-platform] Loaded ${Object.keys(agentSecrets).length} agent(s) from AX_AGENTS`);
       }
     } catch (err) {
       console.error(`[ax-platform] Failed to parse AX_AGENTS: ${err}`);
@@ -328,7 +353,7 @@ function loadAgentSecrets(): AgentConfig {
   // Also load single-agent config as fallback
   const singleId = process.env.AX_AGENT_ID;
   const singleSecret = process.env.AX_WEBHOOK_SECRET;
-  if (singleId && singleSecret) {
+  if (singleId && singleSecret && !agentSecrets[singleId]) {
     agentSecrets[singleId] = singleSecret;
   }
 
@@ -462,9 +487,13 @@ function createAxDispatchHandler(api: ClawdbotPluginApi) {
       api.logger.info(`[ax-platform] Has auth_token: ${hasAuthToken}, Has mcp_endpoint: ${hasMcpEndpoint}`);
 
       // Peek at agent_id from body to look up correct secret (multi-agent support)
+      // Limit to first 2048 bytes to avoid pathological payload cost
+      // Note: This peek is safe because we only use it to select which secret to verify with;
+      // an attacker cannot forge a valid signature without knowing the secret
       let peekAgentId: string | undefined;
-      const agentIdMatch = body.match(/"agent_id"\s*:\s*"([^"]+)"/);
-      if (agentIdMatch) {
+      const peekBody = body.slice(0, 2048);
+      const agentIdMatch = peekBody.match(/"agent_id"\s*:\s*"([a-zA-Z0-9_-]+)"/);
+      if (agentIdMatch && agentIdMatch[1]) {
         peekAgentId = agentIdMatch[1];
         api.logger.info(`[ax-platform] Peeked agent_id: ${peekAgentId}`);
       }
@@ -595,9 +624,6 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     }
     const promptWithContext = contextBlock + cleanPrompt;
 
-    // Escape for shell
-    const escapedPrompt = promptWithContext.replace(/'/g, "'\\''");
-
     api.logger.info(`[ax-platform] Calling moltbot agent with session ${sessionId}...`);
 
     // Send "thinking" progress update so frontend shows spinner
@@ -623,12 +649,21 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     };
 
     // Use clawdbot CLI - full path needed since gateway subprocess doesn't have user's PATH
+    // SECURITY: Use execFile with argument array to avoid shell injection
     const clawdbotCmd = process.env.CLAWDBOT_CMD || '/Users/jacob/.npm-global/bin/clawdbot';
+    const args = [
+      'agent',
+      '--message', promptWithContext,
+      '--session-id', sessionId,
+      '--local',
+      '--json'
+    ];
 
     let output = '';
     try {
-      const { stdout, stderr } = await execAsync(
-        `${clawdbotCmd} agent --message '${escapedPrompt}' --session-id '${sessionId}' --local --json 2>&1`,
+      const { stdout, stderr } = await execFileAsync(
+        clawdbotCmd,
+        args,
         {
           timeout: 120000, // 120 second timeout
           maxBuffer: 1024 * 1024 * 5, // 5MB buffer
@@ -641,7 +676,7 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
       }
       output = stdout.trim();
     } catch (execErr: unknown) {
-      // execAsync throws on non-zero exit, but output may still be valid
+      // execFileAsync throws on non-zero exit, but output may still be valid
       const err = execErr as { stdout?: string; stderr?: string; code?: number; message?: string };
       api.logger.warn(`[ax-platform] Agent command exited with error (code=${err.code}): ${err.message?.substring(0, 100)}`);
       if (err.stdout) {
