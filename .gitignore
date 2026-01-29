@@ -1,7 +1,6 @@
-node_modules/
-.DS_Store
-*.log
-.env
+# Agent config files (contain secrets)
+ax-agents.yaml
+ax-agents.env
 
-# Local documentation (not committed)
-docs/
+# Old yaml example (replaced by .env)
+ax-agents.yaml.example

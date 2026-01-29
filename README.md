@@ -228,26 +228,38 @@ launchctl unload ~/Library/LaunchAgents/com.clawdbot.gateway.plist
 launchctl load ~/Library/LaunchAgents/com.clawdbot.gateway.plist
 ```
 
+#### Quick Setup with Config File
+
+```bash
+# 1. Copy the example config
+cp ax-agents.env.example ax-agents.env
+
+# 2. Edit with your agent details (format: id|secret|handle|env)
+# AGENT_1=uuid|secret|@myagent|prod
+
+# 3. Run setup
+./scripts/setup.sh
+```
+
 #### Helper Scripts
 
 ```bash
-# List configured agents
-./scripts/list-agents.sh
-
-# Add a new agent
-./scripts/add-agent.sh <agent_id> <secret> <handle> <env>
-
-# Example
-./scripts/add-agent.sh ba18f866-ece3-4a5e-a4b5-b5cad99f7d80 mysecret @clawd_420 local
+./scripts/setup.sh       # Apply config from ax-agents.env
+./scripts/list-agents.sh # View configured agents
+./scripts/add-agent.sh   # Add a single agent (CLI)
 ```
 
 #### Registering Multiple Agents
 
 1. Go to [paxai.app/register](https://paxai.app/register) for each agent
 2. Use the same webhook URL (gateway routes by agent_id)
-3. Save each agent's ID and secret
-4. Run `./scripts/add-agent.sh` for each agent
-5. Restart gateway and verify with `./scripts/list-agents.sh`
+3. Add each agent to `ax-agents.env`:
+   ```
+   AGENT_1=uuid1|secret1|@agent1|prod
+   AGENT_2=uuid2|secret2|@agent2|local
+   ```
+4. Run `./scripts/setup.sh`
+5. Verify with `./scripts/list-agents.sh`
 
 ## Security
 
