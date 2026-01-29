@@ -18,11 +18,8 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as crypto from "node:crypto";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-
-const execAsync = promisify(exec);
 import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
 
 // =============================================================================
@@ -298,7 +295,82 @@ interface AxDispatchResponse {
 // Configuration
 // =============================================================================
 
-// Webhook secret for HMAC verification (set via env or config)
+// Multi-agent config: { agent_id: webhook_secret }
+interface AgentConfig {
+  [agentId: string]: string;
+}
+
+let agentSecrets: AgentConfig | null = null;
+
+// Validate agent ID format (UUID or alphanumeric with hyphens/underscores)
+const VALID_AGENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+function loadAgentSecrets(): AgentConfig {
+  if (agentSecrets) return agentSecrets;
+
+  agentSecrets = {};
+
+  // Load from AX_AGENTS JSON env var: [{"id":"...","secret":"..."},...]
+  const agentsJson = process.env.AX_AGENTS;
+  if (agentsJson) {
+    try {
+      const agents = JSON.parse(agentsJson);
+      if (!Array.isArray(agents)) {
+        console.error(`[ax-platform] AX_AGENTS must be a JSON array`);
+      } else {
+        for (const agent of agents) {
+          // Validate entry is an object with id and secret strings
+          if (typeof agent !== 'object' || agent === null) {
+            console.warn(`[ax-platform] Skipping invalid AX_AGENTS entry: not an object`);
+            continue;
+          }
+          const id = typeof agent.id === 'string' ? agent.id.trim() : '';
+          const secret = typeof agent.secret === 'string' ? agent.secret.trim() : '';
+
+          if (!id || !secret) {
+            console.warn(`[ax-platform] Skipping AX_AGENTS entry with missing id or secret`);
+            continue;
+          }
+          if (!VALID_AGENT_ID_PATTERN.test(id)) {
+            console.warn(`[ax-platform] Skipping AX_AGENTS entry with invalid id format: ${id.substring(0, 20)}`);
+            continue;
+          }
+          if (agentSecrets[id]) {
+            console.warn(`[ax-platform] Duplicate agent id in AX_AGENTS: ${id.substring(0, 20)}`);
+          }
+          agentSecrets[id] = secret;
+        }
+        console.log(`[ax-platform] Loaded ${Object.keys(agentSecrets).length} agent(s) from AX_AGENTS`);
+      }
+    } catch (err) {
+      console.error(`[ax-platform] Failed to parse AX_AGENTS: ${err}`);
+    }
+  }
+
+  // Also load single-agent config as fallback
+  const singleId = process.env.AX_AGENT_ID;
+  const singleSecret = process.env.AX_WEBHOOK_SECRET;
+  if (singleId && singleSecret && !agentSecrets[singleId]) {
+    agentSecrets[singleId] = singleSecret;
+  }
+
+  return agentSecrets;
+}
+
+// Get secret for a specific agent, or fall back to default
+function getWebhookSecretForAgent(agentId?: string): string | undefined {
+  const secrets = loadAgentSecrets();
+
+  // Try agent-specific secret first
+  if (agentId && secrets[agentId]) {
+    return secrets[agentId];
+  }
+
+  // Fall back to default single-agent secret
+  return process.env.AX_WEBHOOK_SECRET;
+}
+
+// Legacy: get any configured secret (for backwards compatibility)
 const getWebhookSecret = (): string | undefined => {
   return process.env.AX_WEBHOOK_SECRET;
 };
@@ -403,10 +475,6 @@ function createAxDispatchHandler(api: ClawdbotPluginApi) {
       const body = await readBody(req);
       api.logger.info(`[ax-platform] Body received (${body.length} bytes)`);
 
-      // Verify HMAC signature if secret is configured
-      const webhookSecret = getWebhookSecret();
-      api.logger.info(`[ax-platform] Webhook secret configured: ${!!webhookSecret}`);
-
       // Debug: log first 1000 chars of payload
       api.logger.info(`[ax-platform] Payload preview: ${body.substring(0, 1000)}`);
 
@@ -414,6 +482,22 @@ function createAxDispatchHandler(api: ClawdbotPluginApi) {
       const hasAuthToken = body.includes('"auth_token"');
       const hasMcpEndpoint = body.includes('"mcp_endpoint"');
       api.logger.info(`[ax-platform] Has auth_token: ${hasAuthToken}, Has mcp_endpoint: ${hasMcpEndpoint}`);
+
+      // Peek at agent_id from body to look up correct secret (multi-agent support)
+      // Limit to first 2048 bytes to avoid pathological payload cost
+      // Note: This peek is safe because we only use it to select which secret to verify with;
+      // an attacker cannot forge a valid signature without knowing the secret
+      let peekAgentId: string | undefined;
+      const peekBody = body.slice(0, 2048);
+      const agentIdMatch = peekBody.match(/"agent_id"\s*:\s*"([a-zA-Z0-9_-]+)"/);
+      if (agentIdMatch && agentIdMatch[1]) {
+        peekAgentId = agentIdMatch[1];
+        api.logger.info(`[ax-platform] Peeked agent_id: ${peekAgentId}`);
+      }
+
+      // Verify HMAC signature with agent-specific secret
+      const webhookSecret = getWebhookSecretForAgent(peekAgentId);
+      api.logger.info(`[ax-platform] Webhook secret configured: ${!!webhookSecret} (agent: ${peekAgentId || 'default'})`);
 
       if (webhookSecret) {
         const signature = req.headers["x-ax-signature"] as string | undefined;
@@ -492,12 +576,21 @@ function createAxDispatchHandler(api: ClawdbotPluginApi) {
   };
 }
 
+// Maximum prompt size (100KB) - prevents injection attacks and E2BIG errors
+const MAX_PROMPT_SIZE = 100 * 1024;
+
 async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayload): Promise<string> {
   // V3 uses user_message for the content
-  const prompt = payload.user_message || payload.content || payload.message?.content;
+  let prompt = payload.user_message || payload.content || payload.message?.content;
   if (!prompt) {
     api.logger.warn(`[ax-platform] No content found in payload. Keys: ${Object.keys(payload).join(', ')}`);
     return "No message content received.";
+  }
+
+  // Enforce prompt size limit for security and reliability
+  if (prompt.length > MAX_PROMPT_SIZE) {
+    api.logger.warn(`[ax-platform] Prompt too large (${prompt.length} bytes), truncating to ${MAX_PROMPT_SIZE}`);
+    prompt = prompt.slice(0, MAX_PROMPT_SIZE) + "\n\n[Message truncated due to size limit]";
   }
 
   api.logger.info(`[ax-platform] Got user_message: ${prompt.substring(0, 100)}`);
@@ -537,9 +630,6 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     }
     const promptWithContext = contextBlock + cleanPrompt;
 
-    // Escape for shell
-    const escapedPrompt = promptWithContext.replace(/'/g, "'\\''");
-
     api.logger.info(`[ax-platform] Calling moltbot agent with session ${sessionId}...`);
 
     // Send "thinking" progress update so frontend shows spinner
@@ -565,21 +655,62 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     };
 
     // Use clawdbot CLI - full path needed since gateway subprocess doesn't have user's PATH
+    // SECURITY: Use spawn with argument array to avoid shell injection
+    // Size limit (100KB) enforced above protects against E2BIG errors
     const clawdbotCmd = process.env.CLAWDBOT_CMD || '/Users/jacob/.npm-global/bin/clawdbot';
-    const { stdout, stderr } = await execAsync(
-      `${clawdbotCmd} agent --message '${escapedPrompt}' --session-id '${sessionId}' --local --json 2>&1`,
-      {
-        timeout: 120000, // 120 second timeout
-        maxBuffer: 1024 * 1024 * 5, // 5MB buffer
+    const args = [
+      'agent',
+      '--message', promptWithContext,
+      '--session-id', sessionId,
+      '--local',
+      '--json'
+    ];
+
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = spawn(clawdbotCmd, args, {
         env: subprocessEnv,
-      }
-    );
+      });
 
-    if (stderr) {
-      api.logger.warn(`[ax-platform] Agent stderr: ${stderr.substring(0, 200)}`);
-    }
+      let stdout = '';
+      let stderr = '';
 
-    const output = stdout.trim();
+      // Set timeout manually since spawn doesn't have built-in timeout
+      const timeout = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(new Error('Agent command timed out after 120s'));
+      }, 120000);
+
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timeout);
+        if (stderr) {
+          api.logger.warn(`[ax-platform] Agent stderr: ${stderr.substring(0, 200)}`);
+        }
+        // Even on non-zero exit, try to use stdout if available
+        if (stdout.trim()) {
+          if (code !== 0) {
+            api.logger.warn(`[ax-platform] Agent exited with code ${code}, but has stdout output`);
+          }
+          resolve(stdout.trim());
+        } else if (code !== 0) {
+          reject(new Error(`Agent exited with code ${code}`));
+        } else {
+          resolve('');
+        }
+      });
+    });
     api.logger.info(`[ax-platform] Agent output length: ${output.length}`);
 
     // Parse JSON response - clawdbot --json outputs { payloads: [{ text: "..." }], meta: {...} }
