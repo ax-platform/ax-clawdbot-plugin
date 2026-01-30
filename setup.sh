@@ -154,15 +154,14 @@ cmd_sync() {
     echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
     log_ok "Updated plugin config"
 
-    log_info "Syncing extension files..."
-    if [[ -d "$EXTENSION_DIR" ]]; then
-        cp "$SCRIPT_DIR/extension/index.ts" "$EXTENSION_DIR/index.ts" 2>/dev/null || true
-        cp "$SCRIPT_DIR/extension/lib/auth.ts" "$EXTENSION_DIR/lib/auth.ts" 2>/dev/null || true
-        cp "$SCRIPT_DIR/extension/channel/ax-channel.ts" "$EXTENSION_DIR/channel/ax-channel.ts" 2>/dev/null || true
-        log_ok "Extension files synced"
+    log_info "Reinstalling extension..."
+    cd "$SCRIPT_DIR/extension"
+    if clawdbot plugins install . 2>&1 | grep -v "^\\[" | head -5; then
+        log_ok "Extension installed"
     else
-        log_warn "Extension directory not found - run './setup.sh clean' to install"
+        log_warn "Extension install had warnings (check logs)"
     fi
+    cd "$SCRIPT_DIR"
 
     # Clean stale env vars from plist (prevents signature verification failures)
     if clean_plist_env; then

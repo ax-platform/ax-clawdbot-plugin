@@ -139,20 +139,32 @@ export function createDispatchHandler(
       const agentIdMatch = body.match(/"agent_id"\s*:\s*"([^"]+)"/);
       const agentId = agentIdMatch?.[1];
       api.logger.info(`[ax-platform] Agent ID: ${agentId?.substring(0, 8)}...`);
-      const agent = agentId ? getAgent(agentId) : undefined;
-      api.logger.info(`[ax-platform] Agent found: ${agent ? 'yes' : 'no'}, has secret: ${agent?.secret ? 'yes' : 'no'}`);
 
-      // Verify signature if agent has secret
-      if (agent?.secret) {
-        const signature = req.headers["x-ax-signature"] as string | undefined;
-        const timestamp = req.headers["x-ax-timestamp"] as string | undefined;
-        const verification = verifySignature(body, signature, timestamp, agent.secret);
+      // Reject requests without agent_id
+      if (!agentId) {
+        api.logger.warn("[ax-platform] Missing agent_id in payload");
+        sendJson(res, 400, { status: "error", dispatch_id: "unknown", error: "Missing agent_id" });
+        return true;
+      }
 
-        if (!verification.valid) {
-          api.logger.warn(`[ax-platform] Signature failed: ${verification.error}`);
-          sendJson(res, 401, { status: "error", dispatch_id: "unknown", error: verification.error });
-          return true;
-        }
+      // Reject unknown agent IDs (prevents unauthenticated dispatch)
+      const agent = getAgent(agentId);
+      if (!agent) {
+        api.logger.warn(`[ax-platform] Unknown agent_id: ${agentId.substring(0, 8)}...`);
+        sendJson(res, 401, { status: "error", dispatch_id: "unknown", error: "Unknown agent" });
+        return true;
+      }
+      api.logger.info(`[ax-platform] Agent found: ${agent.handle || agentId.substring(0, 8)}`);
+
+      // Verify HMAC signature (required for all dispatches)
+      const signature = req.headers["x-ax-signature"] as string | undefined;
+      const timestamp = req.headers["x-ax-timestamp"] as string | undefined;
+      const verification = verifySignature(body, signature, timestamp, agent.secret);
+
+      if (!verification.valid) {
+        api.logger.warn(`[ax-platform] Signature failed: ${verification.error}`);
+        sendJson(res, 401, { status: "error", dispatch_id: "unknown", error: verification.error });
+        return true;
       }
 
       // Parse payload
