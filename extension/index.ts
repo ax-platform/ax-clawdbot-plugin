@@ -66,12 +66,79 @@ async function sendProgressUpdate(
 }
 
 // =============================================================================
-// Context Building - Build concise context from payload data
+// Session Management - Track and rotate sessions when bloated
 // =============================================================================
 
 // Track which sessions have been initialized with full context
-// Only inject full context on first message to a session
 const initializedSessions = new Set<string>();
+
+// Track session generations for rotation (agent_id -> generation number)
+const sessionGenerations = new Map<string, number>();
+
+// Track consecutive empty responses per session (for bloat detection)
+const emptyResponseCount = new Map<string, number>();
+
+// Threshold for session rotation (tokens cached)
+const SESSION_BLOAT_THRESHOLD = 80000; // 80K tokens = rotate
+const MAX_EMPTY_RESPONSES = 2; // Rotate after 2 consecutive empty responses
+
+/**
+ * Get current session ID for an agent, handling rotation.
+ * Format: ax-agent-{agent_id} or ax-agent-{agent_id}-gen{N}
+ */
+function getSessionId(agentId: string): string {
+  const gen = sessionGenerations.get(agentId) || 0;
+  if (gen === 0) {
+    return `ax-agent-${agentId}`;
+  }
+  return `ax-agent-${agentId}-gen${gen}`;
+}
+
+/**
+ * Rotate to a new session generation for an agent.
+ * Called when session is bloated or producing empty responses.
+ */
+function rotateSession(agentId: string, logger: { info: (msg: string) => void }): string {
+  const currentGen = sessionGenerations.get(agentId) || 0;
+  const newGen = currentGen + 1;
+  sessionGenerations.set(agentId, newGen);
+
+  // Clear tracking for new session
+  const oldSessionKey = getSessionId(agentId);
+  emptyResponseCount.delete(agentId);
+
+  // Remove old session from initialized set (new session needs full context)
+  for (const key of initializedSessions) {
+    if (key.startsWith(`ax-agent-${agentId}`)) {
+      initializedSessions.delete(key);
+    }
+  }
+
+  const newSessionId = `ax-agent-${agentId}-gen${newGen}`;
+  logger.info(`[ax-platform] Session rotated: ${oldSessionKey} -> ${newSessionId}`);
+  return newSessionId;
+}
+
+/**
+ * Record empty response and check if rotation needed.
+ * Returns true if session should be rotated.
+ */
+function recordEmptyResponse(agentId: string): boolean {
+  const count = (emptyResponseCount.get(agentId) || 0) + 1;
+  emptyResponseCount.set(agentId, count);
+  return count >= MAX_EMPTY_RESPONSES;
+}
+
+/**
+ * Clear empty response count (called on successful response).
+ */
+function clearEmptyResponseCount(agentId: string): void {
+  emptyResponseCount.delete(agentId);
+}
+
+// =============================================================================
+// Context Building - Build concise context from payload data
+// =============================================================================
 
 interface ContextData {
   agents?: Array<{ name: string; description?: string; type?: string }>;
@@ -565,8 +632,9 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
   }
 
   try {
-    // One container per agent - agent_id is the identity
-    const sessionId = `ax-agent-${payload.agent_id || 'default'}`;
+    // Get session ID with rotation support
+    const agentId = payload.agent_id || 'default';
+    const sessionId = getSessionId(agentId);
 
     // Extract just the message content (remove the "username (type): " prefix if present)
     let cleanPrompt = prompt;
@@ -729,6 +797,8 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
 
         if (textValues.length > 0) {
           api.logger.info(`[ax-platform] Found ${textValues.length} text values in raw JSON`);
+          // Success - clear empty response tracking
+          clearEmptyResponseCount(agentId);
           // Concatenate all text values with newlines
           const response = textValues.join('\n\n');
           api.logger.info(`[ax-platform] Combined response: ${response.substring(0, 100)}...`);
@@ -740,16 +810,16 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
         api.logger.info(`[ax-platform] Parsed JSON keys: ${Object.keys(json).join(', ')}`);
 
         // Log session health from meta - critical for debugging bloat
+        const cacheRead = json.meta?.agentMeta?.usage?.cacheRead || 0;
         if (json.meta?.agentMeta?.usage) {
           const usage = json.meta.agentMeta.usage;
-          const cacheRead = usage.cacheRead || 0;
           const input = usage.input || 0;
           const output = usage.output || 0;
           api.logger.info(`[ax-platform] Session tokens - cache: ${cacheRead}, input: ${input}, output: ${output}`);
 
-          // Warn if session is getting bloated (>100K cached tokens)
-          if (cacheRead > 100000) {
-            api.logger.warn(`[ax-platform] SESSION BLOAT WARNING: ${cacheRead} cached tokens - consider session reset`);
+          // Check if session needs rotation due to bloat
+          if (cacheRead > SESSION_BLOAT_THRESHOLD) {
+            api.logger.warn(`[ax-platform] SESSION BLOAT: ${cacheRead} tokens > ${SESSION_BLOAT_THRESHOLD} threshold`);
           }
         }
 
@@ -759,15 +829,22 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
 
           // Handle empty payloads - agent processed but produced no output
           if (json.payloads.length === 0) {
-            const cacheRead = json.meta?.agentMeta?.usage?.cacheRead || 0;
             api.logger.warn(`[ax-platform] Empty payloads - cache: ${cacheRead} tokens, output: ${json.meta?.agentMeta?.usage?.output || 0}`);
 
-            // If session is bloated, suggest the issue
-            if (cacheRead > 50000) {
-              return `@${sender} I'm having trouble responding - my session history may be too large (${Math.round(cacheRead/1000)}K tokens). Please try again or ask an admin to reset my session.`;
+            // Check if we should rotate session
+            const shouldRotate = cacheRead > SESSION_BLOAT_THRESHOLD || recordEmptyResponse(agentId);
+
+            if (shouldRotate) {
+              const newSessionId = rotateSession(agentId, api.logger);
+              api.logger.info(`[ax-platform] Session rotated to ${newSessionId} - next message will use fresh session`);
+              return `@${sender} I had trouble responding (session had ${Math.round(cacheRead/1000)}K tokens cached). I've started a fresh session - please send your message again.`;
             }
+
             return `@${sender} I processed your message but couldn't generate a response. Please try rephrasing your request.`;
           }
+
+          // Success - clear empty response tracking
+          clearEmptyResponseCount(agentId);
 
           if (json.payloads[0]?.text) {
             const response = json.payloads[0].text;
