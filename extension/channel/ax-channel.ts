@@ -28,10 +28,17 @@ import { sendProgressUpdate } from "../lib/api.js";
 import { buildMissionBriefing } from "../lib/context.js";
 
 // Constants
-const DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEDUP_TTL_MS = 15 * 60 * 1000; // 15 minutes (must exceed backend timeout of 10 min)
 const DEDUP_CLEANUP_INTERVAL_MS = 60 * 1000; // Clean up every minute
 const SESSION_CLEANUP_DELAY_MS = 1000; // Grace period before session cleanup
 const LOG_PREVIEW_LENGTH = 100; // Max chars to show in log previews
+
+// Dispatch state for deduplication
+type DispatchState = {
+  status: "in_progress" | "completed";
+  startedAt: number;
+  response?: string; // Cached response for retries after completion
+};
 
 // Runtime instance (set during plugin registration)
 let runtime: PluginRuntime | null = null;
@@ -54,9 +61,9 @@ const dispatchSessions = new Map<string, DispatchSession>();
 // Secondary index: sessionKey -> dispatchId for O(1) lookup
 const sessionKeyIndex = new Map<string, string>();
 
-// Deduplication: track recently processed dispatch IDs (TTL-based)
+// Deduplication: track dispatch state (TTL-based)
 // Prevents duplicate processing when aX backend retries due to timeout
-const processedDispatches = new Map<string, number>(); // dispatchId -> timestamp
+const dispatchStates = new Map<string, DispatchState>();
 
 // Periodic cleanup interval handle (for proper shutdown)
 let cleanupIntervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -69,9 +76,9 @@ function startPeriodicCleanup(): void {
   if (cleanupIntervalHandle) return; // Already running
   cleanupIntervalHandle = setInterval(() => {
     const now = Date.now();
-    for (const [id, timestamp] of processedDispatches) {
-      if (now - timestamp > DEDUP_TTL_MS) {
-        processedDispatches.delete(id);
+    for (const [id, state] of dispatchStates) {
+      if (now - state.startedAt > DEDUP_TTL_MS) {
+        dispatchStates.delete(id);
       }
     }
   }, DEDUP_CLEANUP_INTERVAL_MS);
@@ -88,17 +95,35 @@ function stopPeriodicCleanup(): void {
 }
 
 /**
- * Check if dispatch was recently processed (deduplication)
+ * Check dispatch state for deduplication
+ * Returns: "new" | "in_progress" | "completed"
  */
-function isDuplicateDispatch(dispatchId: string): boolean {
-  // Check if this dispatch was recently processed
-  if (processedDispatches.has(dispatchId)) {
-    return true;
+function checkDispatchState(dispatchId: string): { status: "new" | "in_progress" | "completed"; response?: string } {
+  const state = dispatchStates.get(dispatchId);
+
+  if (!state) {
+    // New dispatch - mark as in_progress
+    dispatchStates.set(dispatchId, { status: "in_progress", startedAt: Date.now() });
+    return { status: "new" };
   }
 
-  // Mark as processed
-  processedDispatches.set(dispatchId, Date.now());
-  return false;
+  if (state.status === "in_progress") {
+    return { status: "in_progress" };
+  }
+
+  // Completed - return cached response
+  return { status: "completed", response: state.response };
+}
+
+/**
+ * Mark dispatch as completed and cache the response
+ */
+function markDispatchCompleted(dispatchId: string, response: string): void {
+  const state = dispatchStates.get(dispatchId);
+  if (state) {
+    state.status = "completed";
+    state.response = response;
+  }
 }
 
 /**
@@ -181,7 +206,7 @@ export function createAxChannel(config: {
         stopPeriodicCleanup();
         dispatchSessions.clear();
         sessionKeyIndex.clear();
-        processedDispatches.clear();
+        dispatchStates.clear();
       },
     },
   };
@@ -265,16 +290,29 @@ export function createDispatchHandler(
       const payload = JSON.parse(body) as AxDispatchPayload;
       const dispatchId = payload.dispatch_id || `ext-${Date.now()}`;
 
-      // Deduplication check - reject if we've recently processed this dispatch
-      if (isDuplicateDispatch(dispatchId)) {
-        api.logger.warn(`[ax-platform] Duplicate dispatch rejected: ${dispatchId}`);
+      // Deduplication check - handle based on dispatch state
+      const dispatchState = checkDispatchState(dispatchId);
+      if (dispatchState.status === "in_progress") {
+        // Retry arrived while still processing - agent is working on it
+        api.logger.warn(`[ax-platform] Dispatch ${dispatchId} still in progress - retry ignored`);
         sendJson(res, 200, {
           status: "success",
           dispatch_id: dispatchId,
-          response: "[Duplicate dispatch - already processed]",
+          response: "[Agent still processing previous request]",
         } satisfies AxDispatchResponse);
         return true;
       }
+      if (dispatchState.status === "completed") {
+        // Already completed - return cached response
+        api.logger.info(`[ax-platform] Dispatch ${dispatchId} already completed - returning cached response`);
+        sendJson(res, 200, {
+          status: "success",
+          dispatch_id: dispatchId,
+          response: dispatchState.response || "[Already processed]",
+        } satisfies AxDispatchResponse);
+        return true;
+      }
+      // status === "new" - proceed with processing
 
       // Session key for CONVERSATION CONTINUITY - based on agent + space
       // This ensures messages to the same agent in the same space share history
@@ -297,7 +335,26 @@ export function createDispatchHandler(
         contextData: payload.context_data,
         startTime: Date.now(),
       };
-      api.logger.info(`[ax-platform] Sender: @${session.senderHandle} (type: ${session.senderType ?? 'unknown'})`);
+      // Log dispatch details (similar to backend's DISPATCH_PAYLOAD)
+      const contextAgents = payload.context_data?.agents?.length || 0;
+      const contextMessages = payload.context_data?.messages?.length || 0;
+      const features = payload.feature_flags || {};
+      const messagePreview = (payload.user_message || payload.content || "").substring(0, 80);
+      api.logger.info(
+        `[ax-platform] DISPATCH_RECEIVED ` +
+        `dispatch_id=${dispatchId.substring(0, 8)} ` +
+        `agent=${session.agentHandle} ` +
+        `sender=@${session.senderHandle} ` +
+        `sender_type=${session.senderType || 'unknown'} ` +
+        `space=${session.spaceName} ` +
+        `context_agents=${contextAgents} ` +
+        `history=${contextMessages} ` +
+        `web=${features.web_browsing ?? false} ` +
+        `mcp=${features.ax_mcp ?? false} ` +
+        `img=${features.image_generation ?? false}`
+      );
+      api.logger.info(`[ax-platform] MESSAGE: "${messagePreview}${messagePreview.length >= 80 ? '...' : ''}"`);
+
       // Store by dispatchId so concurrent dispatches don't overwrite each other
       dispatchSessions.set(dispatchId, session);
       // Maintain secondary index for sessionKey -> dispatchId lookup
@@ -366,9 +423,7 @@ export function createDispatchHandler(
       let deliverCallCount = 0;
       let lastError: string | null = null;
 
-      api.logger.info(`[ax-platform] Calling dispatcher for session ${sessionKey}...`);
-      api.logger.info(`[ax-platform] Message length: ${message.length} chars, context: ${missionBriefing.length} chars`);
-      api.logger.info(`[ax-platform] Sender: ${session.senderHandle} (${session.senderType || 'unknown'})`);
+      api.logger.info(`[ax-platform] Calling dispatcher for session ${sessionKey} (message=${message.length} chars, context=${missionBriefing.length} chars)`);
       const startTime = Date.now();
 
       // Dispatch to agent - this runs the agent and calls deliver() with response
@@ -429,6 +484,9 @@ export function createDispatchHandler(
       } else {
         finalResponse = "[No response from agent]";
       }
+      // Mark dispatch as completed and cache response for retries
+      markDispatchCompleted(dispatchId, finalResponse);
+
       api.logger.info(`[ax-platform] Sending: ${finalResponse.substring(0, LOG_PREVIEW_LENGTH)}${finalResponse.length > LOG_PREVIEW_LENGTH ? '...' : ''}`);
       sendJson(res, 200, {
         status: "success",
