@@ -319,11 +319,14 @@ export function createDispatchHandler(
       if (dispatchState.status === "timed_out") {
         // Been processing too long - this is a timeout
         const elapsedMin = Math.floor((dispatchState.elapsedMs || 0) / 60000);
+        const timeoutMsg = `[Request timed out after ${elapsedMin} minutes]`;
         api.logger.error(`[ax-platform] Dispatch ${dispatchId} timed out after ${elapsedMin}m`);
+        // Mark as completed so subsequent retries don't send duplicate timeout messages
+        markDispatchCompleted(dispatchId, timeoutMsg);
         sendJson(res, 200, {
           status: "success",
           dispatch_id: dispatchId,
-          response: `[Request timed out after ${elapsedMin} minutes - agent may still be working but exceeded time limit]`,
+          response: timeoutMsg,
         } satisfies AxDispatchResponse);
         return true;
       }
