@@ -496,8 +496,15 @@ export function createDispatchHandler(
 
       return true;
     } catch (err) {
-      api.logger.error(`[ax-platform] Dispatch error: ${err}`);
-      sendJson(res, 500, { status: "error", dispatch_id: "unknown", error: String(err) });
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      api.logger.error(`[ax-platform] Dispatch error: ${errorMessage}`);
+
+      // Clean up dispatch state on error so retries aren't incorrectly rejected
+      if (typeof dispatchId !== "undefined") {
+        dispatchStates.delete(dispatchId);
+      }
+
+      sendJson(res, 500, { status: "error", dispatch_id: "unknown", error: errorMessage });
       return true;
     }
   };
