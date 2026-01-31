@@ -28,10 +28,17 @@ import { sendProgressUpdate } from "../lib/api.js";
 import { buildMissionBriefing } from "../lib/context.js";
 
 // Constants
-const DEDUP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEDUP_TTL_MS = 15 * 60 * 1000; // 15 minutes (must exceed backend timeout of 10 min)
 const DEDUP_CLEANUP_INTERVAL_MS = 60 * 1000; // Clean up every minute
 const SESSION_CLEANUP_DELAY_MS = 1000; // Grace period before session cleanup
 const LOG_PREVIEW_LENGTH = 100; // Max chars to show in log previews
+
+// Dispatch state for deduplication
+type DispatchState = {
+  status: "in_progress" | "completed";
+  startedAt: number;
+  response?: string; // Cached response for retries after completion
+};
 
 // Runtime instance (set during plugin registration)
 let runtime: PluginRuntime | null = null;
@@ -54,9 +61,9 @@ const dispatchSessions = new Map<string, DispatchSession>();
 // Secondary index: sessionKey -> dispatchId for O(1) lookup
 const sessionKeyIndex = new Map<string, string>();
 
-// Deduplication: track recently processed dispatch IDs (TTL-based)
+// Deduplication: track dispatch state (TTL-based)
 // Prevents duplicate processing when aX backend retries due to timeout
-const processedDispatches = new Map<string, number>(); // dispatchId -> timestamp
+const dispatchStates = new Map<string, DispatchState>();
 
 // Periodic cleanup interval handle (for proper shutdown)
 let cleanupIntervalHandle: ReturnType<typeof setInterval> | null = null;
@@ -69,9 +76,9 @@ function startPeriodicCleanup(): void {
   if (cleanupIntervalHandle) return; // Already running
   cleanupIntervalHandle = setInterval(() => {
     const now = Date.now();
-    for (const [id, timestamp] of processedDispatches) {
-      if (now - timestamp > DEDUP_TTL_MS) {
-        processedDispatches.delete(id);
+    for (const [id, state] of dispatchStates) {
+      if (now - state.startedAt > DEDUP_TTL_MS) {
+        dispatchStates.delete(id);
       }
     }
   }, DEDUP_CLEANUP_INTERVAL_MS);
@@ -87,18 +94,49 @@ function stopPeriodicCleanup(): void {
   }
 }
 
+// Backend timeout threshold - match backend timeout so first retry = timeout
+// Backend default is 30s, so any retry means we already exceeded the limit
+const BACKEND_TIMEOUT_MS = 30 * 1000; // 30 seconds
+
 /**
- * Check if dispatch was recently processed (deduplication)
+ * Check dispatch state for deduplication
+ * Returns: "new" | "in_progress" | "timed_out" | "completed"
  */
-function isDuplicateDispatch(dispatchId: string): boolean {
-  // Check if this dispatch was recently processed
-  if (processedDispatches.has(dispatchId)) {
-    return true;
+function checkDispatchState(dispatchId: string): {
+  status: "new" | "in_progress" | "timed_out" | "completed";
+  response?: string;
+  elapsedMs?: number;
+} {
+  const state = dispatchStates.get(dispatchId);
+
+  if (!state) {
+    // New dispatch - mark as in_progress
+    dispatchStates.set(dispatchId, { status: "in_progress", startedAt: Date.now() });
+    return { status: "new" };
   }
 
-  // Mark as processed
-  processedDispatches.set(dispatchId, Date.now());
-  return false;
+  if (state.status === "in_progress") {
+    const elapsedMs = Date.now() - state.startedAt;
+    // If we've exceeded the backend timeout, this is a timeout situation
+    if (elapsedMs >= BACKEND_TIMEOUT_MS) {
+      return { status: "timed_out", elapsedMs };
+    }
+    return { status: "in_progress", elapsedMs };
+  }
+
+  // Completed - return cached response
+  return { status: "completed", response: state.response };
+}
+
+/**
+ * Mark dispatch as completed and cache the response
+ */
+function markDispatchCompleted(dispatchId: string, response: string): void {
+  const state = dispatchStates.get(dispatchId);
+  if (state) {
+    state.status = "completed";
+    state.response = response;
+  }
 }
 
 /**
@@ -181,7 +219,7 @@ export function createAxChannel(config: {
         stopPeriodicCleanup();
         dispatchSessions.clear();
         sessionKeyIndex.clear();
-        processedDispatches.clear();
+        dispatchStates.clear();
       },
     },
   };
@@ -265,16 +303,44 @@ export function createDispatchHandler(
       const payload = JSON.parse(body) as AxDispatchPayload;
       const dispatchId = payload.dispatch_id || `ext-${Date.now()}`;
 
-      // Deduplication check - reject if we've recently processed this dispatch
-      if (isDuplicateDispatch(dispatchId)) {
-        api.logger.warn(`[ax-platform] Duplicate dispatch rejected: ${dispatchId}`);
+      // Deduplication check - handle based on dispatch state
+      const dispatchState = checkDispatchState(dispatchId);
+      if (dispatchState.status === "in_progress") {
+        // Retry arrived while still processing - return empty so no message is created
+        const elapsedSec = Math.floor((dispatchState.elapsedMs || 0) / 1000);
+        api.logger.info(`[ax-platform] Dispatch ${dispatchId} still in progress (${elapsedSec}s) - returning empty to suppress message`);
         sendJson(res, 200, {
           status: "success",
           dispatch_id: dispatchId,
-          response: "[Duplicate dispatch - already processed]",
+          response: "", // Empty = no message created, backend keeps retrying
         } satisfies AxDispatchResponse);
         return true;
       }
+      if (dispatchState.status === "timed_out") {
+        // Been processing too long - this is a timeout
+        const elapsedMin = Math.floor((dispatchState.elapsedMs || 0) / 60000);
+        const timeoutMsg = `[Request timed out after ${elapsedMin} minutes]`;
+        api.logger.error(`[ax-platform] Dispatch ${dispatchId} timed out after ${elapsedMin}m`);
+        // Mark as completed so subsequent retries don't send duplicate timeout messages
+        markDispatchCompleted(dispatchId, timeoutMsg);
+        sendJson(res, 200, {
+          status: "success",
+          dispatch_id: dispatchId,
+          response: timeoutMsg,
+        } satisfies AxDispatchResponse);
+        return true;
+      }
+      if (dispatchState.status === "completed") {
+        // Already completed - return cached response
+        api.logger.info(`[ax-platform] Dispatch ${dispatchId} already completed - returning cached response`);
+        sendJson(res, 200, {
+          status: "success",
+          dispatch_id: dispatchId,
+          response: dispatchState.response || "[Already processed]",
+        } satisfies AxDispatchResponse);
+        return true;
+      }
+      // status === "new" - proceed with processing
 
       // Session key for CONVERSATION CONTINUITY - based on agent + space
       // This ensures messages to the same agent in the same space share history
@@ -297,7 +363,26 @@ export function createDispatchHandler(
         contextData: payload.context_data,
         startTime: Date.now(),
       };
-      api.logger.info(`[ax-platform] Sender: @${session.senderHandle} (type: ${session.senderType ?? 'unknown'})`);
+      // Log dispatch details (similar to backend's DISPATCH_PAYLOAD)
+      const contextAgents = payload.context_data?.agents?.length || 0;
+      const contextMessages = payload.context_data?.messages?.length || 0;
+      const features = payload.feature_flags || {};
+      const messagePreview = (payload.user_message || payload.content || "").substring(0, 80);
+      api.logger.info(
+        `[ax-platform] DISPATCH_RECEIVED ` +
+        `dispatch_id=${dispatchId.substring(0, 8)} ` +
+        `agent=${session.agentHandle} ` +
+        `sender=@${session.senderHandle} ` +
+        `sender_type=${session.senderType || 'unknown'} ` +
+        `space=${session.spaceName} ` +
+        `context_agents=${contextAgents} ` +
+        `history=${contextMessages} ` +
+        `web=${features.web_browsing ?? false} ` +
+        `mcp=${features.ax_mcp ?? false} ` +
+        `img=${features.image_generation ?? false}`
+      );
+      api.logger.info(`[ax-platform] MESSAGE: "${messagePreview}${messagePreview.length >= 80 ? '...' : ''}"`);
+
       // Store by dispatchId so concurrent dispatches don't overwrite each other
       dispatchSessions.set(dispatchId, session);
       // Maintain secondary index for sessionKey -> dispatchId lookup
@@ -366,9 +451,7 @@ export function createDispatchHandler(
       let deliverCallCount = 0;
       let lastError: string | null = null;
 
-      api.logger.info(`[ax-platform] Calling dispatcher for session ${sessionKey}...`);
-      api.logger.info(`[ax-platform] Message length: ${message.length} chars, context: ${missionBriefing.length} chars`);
-      api.logger.info(`[ax-platform] Sender: ${session.senderHandle} (${session.senderType || 'unknown'})`);
+      api.logger.info(`[ax-platform] Calling dispatcher for session ${sessionKey} (message=${message.length} chars, context=${missionBriefing.length} chars)`);
       const startTime = Date.now();
 
       // Dispatch to agent - this runs the agent and calls deliver() with response
@@ -423,12 +506,15 @@ export function createDispatchHandler(
       } else if (lastError) {
         finalResponse = `[Agent error: ${lastError}]`;
       } else if (deliverCallCount === 0) {
-        // Agent completed but nothing to deliver - likely NO_REPLY (silent response)
-        // This is valid behavior - the agent chose not to respond
-        finalResponse = "";  // Empty response = agent chose silence
+        // Agent completed but nothing to deliver - NO_REPLY (intentional silence)
+        // This is valid Clawdbot behavior - the agent chose not to respond
+        finalResponse = "[Agent chose not to respond]";
       } else {
         finalResponse = "[No response from agent]";
       }
+      // Mark dispatch as completed and cache response for retries
+      markDispatchCompleted(dispatchId, finalResponse);
+
       api.logger.info(`[ax-platform] Sending: ${finalResponse.substring(0, LOG_PREVIEW_LENGTH)}${finalResponse.length > LOG_PREVIEW_LENGTH ? '...' : ''}`);
       sendJson(res, 200, {
         status: "success",
@@ -438,8 +524,15 @@ export function createDispatchHandler(
 
       return true;
     } catch (err) {
-      api.logger.error(`[ax-platform] Dispatch error: ${err}`);
-      sendJson(res, 500, { status: "error", dispatch_id: "unknown", error: String(err) });
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      api.logger.error(`[ax-platform] Dispatch error: ${errorMessage}`);
+
+      // Clean up dispatch state on error so retries aren't incorrectly rejected
+      if (typeof dispatchId !== "undefined") {
+        dispatchStates.delete(dispatchId);
+      }
+
+      sendJson(res, 500, { status: "error", dispatch_id: "unknown", error: errorMessage });
       return true;
     }
   };

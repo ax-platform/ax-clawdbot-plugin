@@ -15,6 +15,23 @@ Guidance for Claude Code when working with the **aX Platform Plugin for Clawdbot
 ./setup.sh status
 ```
 
+## IMPORTANT: Rebuild After Code Changes
+
+**After modifying any TypeScript files in `extension/`, you MUST rebuild and restart:**
+
+```bash
+./setup.sh sync
+```
+
+This copies the updated code to `~/.clawdbot/extensions/ax-platform/` and restarts the gateway.
+
+**Without this step, your code changes will NOT take effect!**
+
+Common symptoms of forgetting to rebuild:
+- Old error messages still appearing (e.g., "[Duplicate dispatch - already processed]" instead of new message)
+- New logging not showing up
+- Bug fixes not working
+
 ## Project Overview
 
 **ax-clawdbot** is a Clawdbot plugin connecting local agents to [aX Platform](https://paxai.app). Users run their AI locally while participating in cloud workspaces via @mentions.
@@ -110,6 +127,40 @@ curl -X POST http://localhost:18789/ax/dispatch \
 | 401 after secret update | Plist has old AX_AGENTS | Run `./setup.sh sync` (cleans plist) |
 | Connection refused | Tunnel dead | Restart cloudflared, update URL in aX |
 | Agent quarantined | 3+ failed dispatches | Fix issue, un-quarantine in aX admin |
+| "[Agent still processing]" messages | Agent taking longer than backend timeout | See Dispatch Timeouts below |
+| "[Request timed out]" | Agent exceeded 2 min threshold | Increase backend timeout or optimize agent |
+
+### Dispatch Timeouts and Retries
+
+**How it works:**
+
+1. aX backend sends dispatch with timeout (default 30s)
+2. If no response in timeout, backend retries (up to 5 times with backoff)
+3. Plugin tracks dispatch state: `in_progress` → `timed_out` → `completed`
+
+**Messages you'll see:**
+
+| Elapsed Time | Message |
+|--------------|---------|
+| < 2 minutes | `[Agent still processing - Xm elapsed, please wait]` |
+| >= 2 minutes | `[Request timed out after X minutes - agent may still be working...]` |
+| After completion | Cached response returned |
+
+**Backend timeout configuration:**
+
+The aX backend timeout is configured server-side via `WEBHOOK_TIMEOUT_SECONDS` (default 30s).
+For long-running agents, ask your aX admin to increase this.
+
+**Plugin timeout threshold:**
+
+The plugin's 2-minute threshold (`BACKEND_TIMEOUT_MS` in `ax-channel.ts`) should be set
+higher than `(backend_timeout × max_retries)` to allow retries before declaring timeout.
+
+**For agents that need hours:**
+
+1. Increase backend `WEBHOOK_TIMEOUT_SECONDS` to desired duration
+2. Increase plugin `BACKEND_TIMEOUT_MS` to match
+3. Consider using progress updates to keep connection alive
 
 ### Debug Commands
 
